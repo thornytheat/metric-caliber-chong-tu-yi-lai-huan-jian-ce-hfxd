@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import conflict, expr, gate, graph as graph_mod, registry, report, seed, settings, store
+from . import conflict, expr, gate, graph as graph_mod, migration, registry, report, seed, settings, store
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -24,7 +24,7 @@ async def lifespan(application: FastAPI):
     yield
 
 
-app = FastAPI(title=settings.APP_NAME, version="1.0.0", lifespan=lifespan)
+app = FastAPI(title=settings.APP_NAME, version="1.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -35,14 +35,22 @@ def load_metrics() -> list[dict]:
     return [registry.with_normalized(metric) for metric in metrics]
 
 
+def load_aliases() -> list[dict]:
+    with store.session() as conn:
+        store.init_schema(conn)
+        return store.list_aliases(conn)
+
+
 def base_context(request: Request, **extra: Any) -> dict:
     metrics = load_metrics()
-    overview = report.overview(metrics)
+    aliases = load_aliases()
+    overview = report.overview(metrics, aliases)
     context = {
         "app_name": settings.APP_NAME,
         "app_short": settings.APP_SHORT,
         "overview": overview,
         "metrics": metrics,
+        "aliases": aliases,
         "error": None,
         "notice": None,
     }
@@ -84,6 +92,20 @@ class RegistryRequest(BaseModel):
     allow_missing_reference: bool = False
 
 
+class RenameItem(BaseModel):
+    old_name: str
+    new_name: str
+
+
+class MigrationPreviewRequest(BaseModel):
+    renames: list[RenameItem] = Field(default_factory=list)
+    persist: bool = True
+
+
+class MigrationCommitRequest(BaseModel):
+    renames: list[RenameItem] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------- 页面
 
 
@@ -98,10 +120,12 @@ def health() -> dict:
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
     metrics = load_metrics()
-    overview = report.overview(metrics)
+    aliases = load_aliases()
+    overview = report.overview(metrics, aliases)
     with store.session() as conn:
         store.init_schema(conn)
         recent_checks = store.list_checks(conn, limit=6)
+        migrations = store.list_migrations(conn, limit=5)
     top = sorted(
         overview["conflicts"], key=lambda item: item["variant_count"], reverse=True
     )[:3]
@@ -111,10 +135,12 @@ def index(request: Request) -> HTMLResponse:
         "app_short": settings.APP_SHORT,
         "overview": overview,
         "metrics": metrics,
+        "aliases": aliases,
         "top_conflicts": top,
         "cycles": cycles,
         "seed_result": getattr(app.state, "seed_result", {"seeded": False, "reason": "启动中"}),
         "recent_checks": recent_checks,
+        "migrations": migrations,
         "error": None,
         "notice": None,
         "page": "index",
@@ -126,6 +152,7 @@ def index(request: Request) -> HTMLResponse:
 @app.get("/workbench", response_class=HTMLResponse)
 def workbench(request: Request) -> HTMLResponse:
     metrics = load_metrics()
+    aliases = load_aliases()
     names = registry.names(metrics)
     versions = {
         name: [
@@ -146,23 +173,25 @@ def workbench(request: Request) -> HTMLResponse:
     }
     focus = registry.versions_of(metrics, "gmv_daily")
     focus_metric = focus[0] if focus else None
+    graph = graph_mod.build_graph(metrics, aliases)
     context = {
         "app_name": settings.APP_NAME,
         "app_short": settings.APP_SHORT,
-        "overview": report.overview(metrics),
+        "overview": report.overview(metrics, aliases),
         "metrics": metrics,
+        "aliases": aliases,
         "names": names,
         "versions": versions,
         "focus": focus_metric,
         "focus_key": graph_mod.node_key(focus_metric["name"], focus_metric["version"]) if focus_metric else "",
         "focus_rows": graph_mod.dependency_rows(
-            graph_mod.build_graph(metrics),
+            graph,
             graph_mod.node_key(focus_metric["name"], focus_metric["version"]),
         )
         if focus_metric
         else [],
         "focus_downstream": graph_mod.downstream(
-            graph_mod.build_graph(metrics),
+            graph,
             graph_mod.node_key(focus_metric["name"], focus_metric["version"]),
         )
         if focus_metric
@@ -180,11 +209,13 @@ def result_page(request: Request, check_id: str) -> HTMLResponse:
     with store.session() as conn:
         payload = store.load_check(conn, check_id)
     metrics = load_metrics()
+    aliases = load_aliases()
     context = {
         "app_name": settings.APP_NAME,
         "app_short": settings.APP_SHORT,
-        "overview": report.overview(metrics),
+        "overview": report.overview(metrics, aliases),
         "metrics": metrics,
+        "aliases": aliases,
         "check": payload,
         "check_id": check_id,
         "missing": payload is None,
@@ -199,6 +230,7 @@ def result_page(request: Request, check_id: str) -> HTMLResponse:
 @app.get("/review", response_class=HTMLResponse)
 def review(request: Request) -> HTMLResponse:
     metrics = load_metrics()
+    aliases = load_aliases()
     with store.session() as conn:
         latest = store.latest_check(conn)
         impact = store.latest_impact(conn)
@@ -207,8 +239,9 @@ def review(request: Request) -> HTMLResponse:
     context = {
         "app_name": settings.APP_NAME,
         "app_short": settings.APP_SHORT,
-        "overview": report.overview(metrics),
+        "overview": report.overview(metrics, aliases),
         "metrics": metrics,
+        "aliases": aliases,
         "latest": latest,
         "impact": impact,
         "events": events,
@@ -227,7 +260,8 @@ def review(request: Request) -> HTMLResponse:
 @app.get("/api/registry")
 def api_registry() -> dict:
     metrics = load_metrics()
-    overview = report.overview(metrics)
+    aliases = load_aliases()
+    overview = report.overview(metrics, aliases)
     return {
         "app": settings.APP_SHORT,
         "stats": {
@@ -240,6 +274,7 @@ def api_registry() -> dict:
             "publish_blocked_count": overview["publish_blocked_count"],
             "unresolved_count": overview["unresolved_count"],
             "cross_version_count": overview["cross_version_count"],
+            "alias_count": len(aliases),
         },
         "metrics": [
             {
@@ -418,7 +453,8 @@ def api_parse(payload: ParseRequest = Body(default=ParseRequest())) -> JSONRespo
 
 def _run_and_store_check() -> dict:
     metrics = load_metrics()
-    payload = report.build_check(metrics)
+    aliases = load_aliases()
+    payload = report.build_check(metrics, aliases=aliases)
     now = report.now_iso()
     with store.session() as conn:
         store.init_schema(conn)
@@ -456,6 +492,7 @@ def api_check_detail(check_id: str) -> dict:
 @app.post("/api/impact")
 def api_impact(payload: ImpactRequest) -> dict:
     metrics = load_metrics()
+    aliases = load_aliases()
     if not any(metric["name"] == payload.name for metric in metrics):
         raise HTTPException(status_code=404, detail=f"指标 {payload.name} 未注册")
     version = payload.version
@@ -470,6 +507,7 @@ def api_impact(payload: ImpactRequest) -> dict:
             expression=payload.expression,
             aggregation=payload.aggregation,
             dimensions=payload.dimensions,
+            aliases=aliases,
         )
     except gate.ExpressionInvalid as exc:
         raise HTTPException(
@@ -494,8 +532,9 @@ def api_impact(payload: ImpactRequest) -> dict:
 @app.post("/api/publish")
 def api_publish(payload: PublishRequest) -> JSONResponse:
     metrics = load_metrics()
+    aliases = load_aliases()
     try:
-        result = gate.publish_check(metrics, payload.name, int(payload.version))
+        result = gate.publish_check(metrics, payload.name, int(payload.version), aliases)
     except gate.GateError as exc:
         raise HTTPException(status_code=404, detail={"error": exc.message})
     if not result["ok"]:
@@ -535,3 +574,201 @@ def api_metrics() -> dict:
             for metric in metrics
         ],
     }
+
+
+# --------------------------------------------------------------------------- 改名迁移
+
+
+def _renames_from_request(items: list[RenameItem]) -> list[dict]:
+    return [{"old_name": item.old_name.strip(), "new_name": item.new_name.strip()} for item in items]
+
+
+@app.post("/api/migrations/preview")
+def api_migration_preview(payload: MigrationPreviewRequest) -> JSONResponse:
+    """预演：受影响公式、新旧名称冲突、预演后的依赖变化（不落注册表）。"""
+    metrics = load_metrics()
+    aliases = load_aliases()
+    try:
+        renames = migration.normalize_renames(_renames_from_request(payload.renames))
+        preview = migration.build_preview(metrics, renames, aliases)
+    except migration.MigrationError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict())
+    status_code = 200
+    if payload.persist:
+        now = report.now_iso()
+        with store.session() as conn:
+            store.init_schema(conn)
+            record = store.upsert_migration_preview(conn, preview, now)
+        preview["stored_status"] = record["status"]
+    return JSONResponse(status_code=status_code, content=preview)
+
+
+@app.post("/api/migrations/commit")
+def api_migration_commit(payload: MigrationCommitRequest) -> JSONResponse:
+    """预演通过后一次性切换；切换失败回滚旧版注册表并返回 409。"""
+    try:
+        renames = migration.normalize_renames(_renames_from_request(payload.renames))
+    except migration.MigrationError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict())
+    mig_id = migration.migration_id(renames)
+
+    # 幂等优先：同指纹迁移已切换过则直接返回，不依赖当前注册表状态
+    # （重试时旧名可能已不存在，不能再拿当前注册表重跑预演）
+    with store.session() as conn:
+        store.init_schema(conn)
+        existing = store.get_migration(conn, mig_id)
+    if existing and existing["status"] == "committed":
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "idempotent": True,
+                "migration_id": mig_id,
+                "status": "committed",
+                "renames": renames,
+                "note": "该组改名已切换过，本次为幂等重试，未重复产生迁移记录或版本",
+            },
+        )
+
+    metrics = load_metrics()
+    aliases = load_aliases()
+    preview = migration.build_preview(metrics, renames, aliases)
+
+    if not preview["ok"] or preview["blocked"]:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "code": "preview_blocked",
+                "migration_id": preview["migration_id"],
+                "conflicts": preview["conflicts"],
+                "reason": preview.get("reason", "预演未通过，拒绝切换"),
+                "edge_diff": preview.get("edge_diff"),
+                "new_unresolved": preview.get("new_unresolved"),
+            },
+        )
+
+    new_metrics, _changes = migration.apply_renames(metrics, renames)
+    now = report.now_iso()
+    try:
+        with store.session() as conn:
+            store.init_schema(conn)
+            record = store.apply_rename_migration(conn, renames, preview, new_metrics, now)
+    except store.MigrationApplyError as exc:
+        with store.session() as conn:
+            failed = store.get_migration(conn, mig_id)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "code": "rolled_back",
+                "migration_id": mig_id,
+                "status": failed["status"] if failed else "rolled_back",
+                "reason": str(exc),
+                "note": "切换失败，注册表已恢复到迁移前的旧版；可修正后重试，迁移号与版本号不变",
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "ok": True,
+            "idempotent": False,
+            "migration_id": record["migration_id"],
+            "status": record["status"],
+            "renames": renames,
+            "affected_summary": preview["affected_summary"],
+            "aliases": preview["aliases_to_create"],
+        },
+    )
+
+
+@app.get("/api/migrations")
+def api_migration_list(limit: int = 20) -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        items = store.list_migrations(conn, limit=limit)
+    return {"count": len(items), "migrations": items}
+
+
+@app.get("/api/migrations/{migration_id}")
+def api_migration_detail(migration_id: str) -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        record = store.get_migration(conn, migration_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"迁移记录 {migration_id} 不存在")
+    return record
+
+
+@app.get("/api/aliases")
+def api_aliases() -> dict:
+    """旧名 → 当前名/版本/迁移来源，支撑历史公式兼容与追溯。"""
+    aliases = load_aliases()
+    metrics = load_metrics()
+    current_names = set(registry.names(metrics))
+    enriched = []
+    for alias in aliases:
+        chain = migration.alias_chain(alias["old_name"], aliases)
+        current = chain[-1]
+        enriched.append(
+            {
+                **alias,
+                "current_name": current if current in current_names else alias["new_name"],
+                "chain": chain,
+                "current_exists": current in current_names,
+            }
+        )
+    return {"count": len(enriched), "aliases": enriched}
+
+
+@app.get("/api/names/resolve")
+def api_resolve_name(name: str) -> dict:
+    """按（可能是历史旧名的）名字查当前指标版本与迁移来源。"""
+    metrics = load_metrics()
+    aliases = load_aliases()
+    current = migration.resolve_alias(name, metrics, aliases)
+    versions = registry.versions_of(metrics, current)
+    source = next((alias for alias in aliases if alias["old_name"] == name), None)
+    if not versions and source is None:
+        raise HTTPException(status_code=404, detail=f"名字 {name} 既不是当前指标也不是历史旧名")
+    return {
+        "query": name,
+        "current_name": current,
+        "is_historical_name": current != name,
+        "migration_source": source["migration_id"] if source else None,
+        "chain": migration.alias_chain(name, aliases),
+        "versions": [
+            {
+                "key": graph_mod.node_key(metric["name"], metric["version"]),
+                "name": metric["name"],
+                "version": metric["version"],
+                "expression": metric["expression"],
+                "normalized": registry.normalized_of(metric),
+                "published": bool(metric["published"]),
+            }
+            for metric in versions
+        ],
+    }
+
+
+@app.get("/migrations", response_class=HTMLResponse)
+def migrations_page(request: Request) -> HTMLResponse:
+    metrics = load_metrics()
+    aliases = load_aliases()
+    with store.session() as conn:
+        store.init_schema(conn)
+        records = store.list_migrations(conn, limit=20)
+    context = {
+        "app_name": settings.APP_NAME,
+        "app_short": settings.APP_SHORT,
+        "overview": report.overview(metrics, aliases),
+        "metrics": metrics,
+        "aliases": aliases,
+        "migration_records": records,
+        "metric_names": registry.names(metrics),
+        "error": None,
+        "notice": None,
+        "page": "migrations",
+        "active": "migrations",
+    }
+    return templates.TemplateResponse(request, "migrations.html", context)

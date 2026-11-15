@@ -384,4 +384,182 @@
       }
     });
   });
+
+  // ---------------------------------------------------------------- 改名迁移页
+  var renameTable = qs('#rename-rows');
+  if (renameTable) { initMigrationPage(); }
+
+  function initMigrationPage() {
+    var tbody = qs('tbody', renameTable);
+    var previewPanel = qs('#migration-preview');
+    var commitButton = qs('#btn-commit');
+    var errorHost = qs('#migration-error');
+    var lastPreview = null;
+    var metricNames = window.MIGRATION_METRIC_NAMES || [];
+
+    function addRow(oldName, newName) {
+      var tr = document.createElement('tr');
+      var oldOptions = metricNames.map(function (n) {
+        return '<option value="' + esc(n) + '"' + (n === oldName ? ' selected' : '') + '>' + esc(n) + '</option>';
+      }).join('');
+      tr.innerHTML =
+        '<td><select class="rename-old">' + oldOptions + '</select></td>' +
+        '<td><input type="text" class="rename-new" placeholder="new_metric_name" value="' + esc(newName || '') + '"></td>' +
+        '<td><button type="button" class="secondary small btn-remove-rename">删除</button></td>';
+      tbody.appendChild(tr);
+      qs('.btn-remove-rename', tr).addEventListener('click', function () {
+        tr.parentNode.removeChild(tr);
+        invalidatePreview();
+      });
+      qsa('select,input', tr).forEach(function (el) {
+        el.addEventListener('change', invalidatePreview);
+      });
+      invalidatePreview();
+    }
+
+    function invalidatePreview() {
+      lastPreview = null;
+      commitButton.disabled = true;
+      previewPanel.hidden = true;
+    }
+
+    function collectRenames() {
+      return qsa('tr', tbody).map(function (tr) {
+        return {
+          old_name: qs('.rename-old', tr).value.trim(),
+          new_name: qs('.rename-new', tr).value.trim()
+        };
+      }).filter(function (item) { return item.old_name && item.new_name; });
+    }
+
+    qs('#btn-add-rename').addEventListener('click', function () { addRow(metricNames[0] || '', ''); });
+    addRow(metricNames.indexOf('gmv_daily') >= 0 ? 'gmv_daily' : (metricNames[0] || ''), 'net_gmv_daily');
+
+    function renderConflicts(preview) {
+      var host = qs('#preview-conflicts');
+      if (!preview.conflicts || !preview.conflicts.length) {
+        host.innerHTML = '<div class="alert alert-info" style="margin-bottom:10px">名称校验通过：无新旧名冲突、无改名链、无重复目标。</div>';
+        return;
+      }
+      host.innerHTML = '<div class="alert alert-error" style="margin-bottom:10px"><strong>发现 ' +
+        preview.conflicts.length + ' 个名称冲突，预演被阻断：</strong><ul class="list small" style="margin:4px 0 0">' +
+        preview.conflicts.map(function (c) {
+          return '<li>' + tag(c.code, 'err') + ' ' + esc(c.detail) + '</li>';
+        }).join('') + '</ul></div>';
+    }
+
+    function renderPreview(preview) {
+      lastPreview = preview;
+      previewPanel.hidden = false;
+      qs('#preview-mig-id').textContent = preview.migration_id;
+      var verdict = qs('#preview-verdict');
+      var blocked = preview.blocked || !preview.ok;
+      verdict.textContent = blocked ? '预演阻断' : '预演通过';
+      verdict.className = 'tag ' + (blocked ? 'err' : 'ok');
+      commitButton.disabled = blocked;
+      renderConflicts(preview);
+
+      var summary = preview.affected_summary || {};
+      qs('#preview-kpis').innerHTML = [
+        ['改名指标', summary.renamed_metric_count || 0],
+        ['改名版本', summary.renamed_version_count || 0],
+        ['受影响公式', summary.affected_formula_count || 0],
+        ['改写引用', summary.reference_rewrite_count || 0]
+      ].map(function (pair) {
+        return '<div class="kpi"><div class="k-label">' + esc(pair[0]) + '</div>' +
+          '<div class="k-value">' + esc(pair[1]) + '</div></div>';
+      }).join('');
+
+      var formulaBody = qs('#preview-formulas tbody');
+      formulaBody.innerHTML = (preview.affected_formulas || []).map(function (f) {
+        var same = f.normalized_before === f.normalized_after;
+        return '<tr>' +
+          '<td class="mono small">' + esc(f.old_key) + '</td>' +
+          '<td class="mono small"><strong>' + esc(f.new_key) + '</strong></td>' +
+          '<td class="small">' + (f.expression_rewritten ? tag('已改写', 'warn') : tag('仅改名', '')) +
+            '<div class="muted mono small">' + esc(f.old_expression) + ' → ' + esc(f.new_expression) + '</div></td>' +
+          '<td class="mono small">' + (same ? tag('口径不变', 'ok') : tag('口径变化', 'err')) +
+            '<div class="muted small">' + esc(f.normalized_before) + '<br>→ ' + esc(f.normalized_after) + '</div></td>' +
+          '<td>' + (f.published ? tag('已发布', 'ok') : tag('未发布', 'warn')) + '</td>' +
+          '</tr>';
+      }).join('') || '<tr><td colspan="5" class="empty">无受影响公式。</td></tr>';
+
+      var diff = preview.edge_diff || {};
+      var depsHost = qs('#preview-deps');
+      var gb = preview.graph_before || {};
+      var ga = preview.graph_after || {};
+      depsHost.innerHTML =
+        '<div class="small">依赖边：' +
+        tag('结构守恒', diff.structure_preserved ? 'ok' : 'err') +
+        ' 新增 ' + esc((diff.added || []).length) + ' / 删除 ' + esc((diff.removed || []).length) +
+        '；节点 ' + esc(gb.node_count || 0) + '→' + esc(ga.node_count || 0) +
+        '，边 ' + esc(gb.edge_count || 0) + '→' + esc(ga.edge_count || 0) +
+        '，环 ' + esc(gb.cycle_count || 0) + '→' + esc(ga.cycle_count || 0) + '</div>' +
+        ((preview.new_unresolved || []).length
+          ? '<div class="alert alert-error" style="margin-top:8px">新不可解析引用：' +
+            preview.new_unresolved.map(esc).join('、') + '</div>'
+          : '<div class="small muted" style="margin-top:6px">无新增不可解析引用；旧名别名将在切换后保证历史公式继续解析。</div>') +
+        (preview.reason ? '<div class="alert alert-error" style="margin-top:8px">' + esc(preview.reason) + '</div>' : '');
+    }
+
+    qs('#btn-preview').addEventListener('click', async function () {
+      clearError(errorHost);
+      var renames = collectRenames();
+      if (!renames.length) {
+        showError(errorHost, new Error('请至少填写一条改名'));
+        return;
+      }
+      try {
+        var preview = await postJSON('/api/migrations/preview', { renames: renames, persist: true });
+        renderPreview(preview);
+      } catch (err) {
+        previewPanel.hidden = true;
+        showError(errorHost, err);
+      }
+    });
+
+    commitButton.addEventListener('click', async function () {
+      clearError(errorHost);
+      var renames = collectRenames();
+      commitButton.disabled = true;
+      try {
+        var result = await postJSON('/api/migrations/commit', { renames: renames });
+        var note = result.idempotent ? '（幂等重试，未重复产生迁移记录或版本）' : '（一次性切换成功）';
+        errorHost.hidden = false;
+        errorHost.className = 'alert alert-info';
+        errorHost.innerHTML = '<strong>' + esc(result.migration_id) + ' ' + esc(result.status) + '</strong> ' +
+          esc(note) + '，2 秒后刷新页面…';
+        setTimeout(function () { window.location.reload(); }, 2000);
+      } catch (err) {
+        errorHost.className = 'alert alert-error';
+        var detail = err.data || {};
+        showError(errorHost, new Error((detail.reason || err.message) + '（注册表已回滚，可重试，迁移号不变）'));
+        commitButton.disabled = false;
+      }
+    });
+
+    qs('#btn-resolve').addEventListener('click', async function () {
+      var host = qs('#resolve-out');
+      var name = qs('#resolve-name').value.trim();
+      if (!name) { host.innerHTML = ''; return; }
+      try {
+        var res = await fetch('/api/names/resolve?name=' + encodeURIComponent(name));
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '查询失败');
+        host.innerHTML =
+          '<div class="small">查询名 <code>' + esc(data.query) + '</code> → 当前名 <code>' +
+          esc(data.current_name) + '</code>' +
+          (data.is_historical_name ? tag('历史旧名', 'warn') : tag('当前名', 'ok')) +
+          (data.migration_source ? ' 来源 <a href="/api/migrations/' + esc(data.migration_source) + '"><code>' +
+            esc(data.migration_source) + '</code></a>' : '') + '</div>' +
+          '<div class="small muted" style="margin:4px 0">链路：' + data.chain.map(esc).join(' → ') + '</div>' +
+          '<ul class="list small" style="margin:4px 0 0">' + data.versions.map(function (v) {
+            return '<li><code>' + esc(v.key) + '</code> ' + (v.published ? tag('已发布', 'ok') : tag('未发布', 'warn')) +
+              ' <span class="muted">' + esc(v.normalized) + '</span></li>';
+          }).join('') + '</ul>';
+      } catch (err) {
+        host.innerHTML = '<div class="alert alert-error">' + esc(err.message) + '</div>';
+      }
+    });
+  }
 })();

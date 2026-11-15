@@ -28,40 +28,69 @@ class ExpressionInvalid(GateError):
     """新表达式非法 → HTTP 400。"""
 
 
-def _resolve(ref: dict, metrics: list[dict], index: dict, published: dict) -> dict:
+def _current_name(name: str, metrics: list[dict], aliases: list[dict] | None) -> str:
+    """经改名别名把旧名解析到当前名；无别名或已是当前名时原样返回。"""
+    if not aliases:
+        return name
+    names = {metric["name"] for metric in metrics}
+    if name in names:
+        return name
+    cursor, seen = name, set()
+    for _ in range(32):
+        if cursor in names or cursor in seen:
+            break
+        seen.add(cursor)
+        step = next(
+            (alias["new_name"] for alias in aliases if alias["old_name"] == cursor), None
+        )
+        if step is None:
+            break
+        cursor = step
+    return cursor
+
+
+def _resolve(ref: dict, metrics: list[dict], index: dict, published: dict,
+             aliases: list[dict] | None = None) -> dict:
     """把一次引用解析成 {'ref','target','reason','published'}。"""
     name = ref["name"]
     version = ref["version"]
+    resolved_name = _current_name(name, metrics, aliases)
     if version is not None:
-        key = graph_mod.node_key(name, version)
-        target = index.get((name, version))
+        key = graph_mod.node_key(resolved_name, version)
+        target = index.get((resolved_name, version))
         if target is None:
-            return {"ref": ref, "target": key, "reason": "version_not_found", "published": None}
+            return {"ref": ref, "target": graph_mod.node_key(name, version),
+                    "reason": "version_not_found", "published": None}
         return {"ref": ref, "target": key, "reason": None, "published": bool(target["published"])}
-    latest = published.get(name)
+    latest = published.get(resolved_name)
     if latest is None:
         names = {metric["name"] for metric in metrics}
-        reason = "no_published_version" if name in names else "metric_not_found"
+        if resolved_name in names:
+            reason = "no_published_version"
+        elif aliases and any(alias["old_name"] == name for alias in aliases):
+            reason = "alias_no_published_version"
+        else:
+            reason = "metric_not_found"
         return {"ref": ref, "target": name, "reason": reason, "published": None}
     return {
         "ref": ref,
-        "target": graph_mod.node_key(name, latest["version"]),
+        "target": graph_mod.node_key(resolved_name, latest["version"]),
         "reason": None,
         "published": True,
     }
 
 
-def reference_findings(metric: dict, metrics: list[dict]) -> list[dict]:
+def reference_findings(metric: dict, metrics: list[dict], aliases: list[dict] | None = None) -> list[dict]:
     index = registry.index_by_key(metrics)
     published = registry.latest_published(metrics)
     analysis = expr.analyze_expression(metric["expression"])
     findings = []
     for ref in analysis["metrics"]:
-        findings.append(_resolve(ref, metrics, index, published))
+        findings.append(_resolve(ref, metrics, index, published, aliases))
     return findings
 
 
-def cross_version_refs(metrics: list[dict]) -> list[dict]:
+def cross_version_refs(metrics: list[dict], aliases: list[dict] | None = None) -> list[dict]:
     """显式 @版本 的跨版本引用（含引用了更旧版本或未发布版本）。"""
     index = registry.index_by_key(metrics)
     published = registry.latest_published(metrics)
@@ -72,8 +101,9 @@ def cross_version_refs(metrics: list[dict]) -> list[dict]:
         for ref in analysis["metrics"]:
             if ref["version"] is None:
                 continue
-            resolved = _resolve(ref, metrics, index, published)
-            latest = published.get(ref["name"])
+            resolved = _resolve(ref, metrics, index, published, aliases)
+            resolved_name = _current_name(ref["name"], metrics, aliases)
+            latest = published.get(resolved_name)
             items.append(
                 {
                     "from": from_key,
@@ -92,12 +122,12 @@ def cross_version_refs(metrics: list[dict]) -> list[dict]:
     return items
 
 
-def publish_blockers(metrics: list[dict]) -> list[dict]:
+def publish_blockers(metrics: list[dict], aliases: list[dict] | None = None) -> list[dict]:
     """注册表整体发布校验：引用未发布版本 / 引用不存在的指标或版本。"""
     blockers = []
     for metric in metrics:
         key = graph_mod.node_key(metric["name"], metric["version"])
-        findings = reference_findings(metric, metrics)
+        findings = reference_findings(metric, metrics, aliases)
         unpublished = [
             finding["target"]
             for finding in findings
@@ -155,6 +185,7 @@ def change_impact(
     new_expression: str,
     new_aggregation: str | None = None,
     new_dimensions: list[str] | None = None,
+    aliases: list[dict] | None = None,
 ) -> dict:
     """核心规则：改口径前算清下游影响面与 breaking 清单。"""
     index = registry.index_by_key(metrics)
@@ -183,7 +214,7 @@ def change_impact(
     aggregation_changed = proposed_agg != old_agg
     expression_changed = new_normalized != old_normalized
 
-    base_graph = graph_mod.build_graph(metrics)
+    base_graph = graph_mod.build_graph(metrics, aliases)
     downstream = graph_mod.downstream(base_graph, key)
 
     # 改动后是否引入环（只关心涉及本指标的环）
@@ -197,7 +228,7 @@ def change_impact(
             "normalized": new_normalized,
         },
     )
-    patched_graph = graph_mod.build_graph(patched)
+    patched_graph = graph_mod.build_graph(patched, aliases)
     patched_cycles = graph_mod.find_cycles(patched_graph)
     cycle_paths = [cycle["path"] for cycle in patched_cycles if key in cycle["path"]]
     cycle_introduced = bool(cycle_paths)
@@ -215,7 +246,7 @@ def change_impact(
     unpublished_refs = []
     missing_refs = []
     for ref in analysis["metrics"]:
-        resolved = _resolve(ref, patched, registry.index_by_key(patched), published)
+        resolved = _resolve(ref, patched, registry.index_by_key(patched), published, aliases)
         if resolved["published"] is False:
             unpublished_refs.append(resolved["target"])
         elif resolved["reason"] in ("version_not_found", "metric_not_found", "no_published_version"):
@@ -380,7 +411,8 @@ def _impact_notes(
     return notes
 
 
-def publish_check(metrics: list[dict], name: str, version: int) -> dict:
+def publish_check(metrics: list[dict], name: str, version: int,
+                  aliases: list[dict] | None = None) -> dict:
     """发布门禁：未发布引用 / 缺失引用 / 环内指标 / 同名异口径 全部拦截。"""
     index = registry.index_by_key(metrics)
     target = index.get((name, int(version)))
@@ -398,7 +430,7 @@ def publish_check(metrics: list[dict], name: str, version: int) -> dict:
             }
         )
 
-    for finding in reference_findings(target, metrics):
+    for finding in reference_findings(target, metrics, aliases):
         if finding["published"] is False:
             blockers.append(
                 {
@@ -414,7 +446,7 @@ def publish_check(metrics: list[dict], name: str, version: int) -> dict:
                 }
             )
 
-    graph = graph_mod.build_graph(metrics)
+    graph = graph_mod.build_graph(metrics, aliases)
     cycle_members = graph_mod.cycle_nodes(graph)
     if key in cycle_members:
         path = next(

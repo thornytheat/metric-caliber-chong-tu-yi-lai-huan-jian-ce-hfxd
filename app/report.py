@@ -26,13 +26,13 @@ def fingerprint(payload: dict) -> str:
     ).hexdigest()[:12]
 
 
-def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
-    graph = graph_mod.build_graph(metrics)
+def build_check(metrics: list[dict], check_id: str | None = None, aliases: list[dict] | None = None) -> dict:
+    graph = graph_mod.build_graph(metrics, aliases)
     cycles = graph_mod.find_cycles(graph)
     conflicts = conflict.detect_conflicts(metrics)
     duplicates = conflict.detect_same_caliber_duplicates(metrics)
-    blockers = gate.publish_blockers(metrics)
-    cross = gate.cross_version_refs(metrics)
+    blockers = gate.publish_blockers(metrics, aliases)
+    cross = gate.cross_version_refs(metrics, aliases)
     summary = graph_mod.summary(graph)
 
     published = [metric for metric in metrics if metric["published"]]
@@ -108,7 +108,8 @@ def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
 
 def build_impact(metrics: list[dict], name: str, version: int, expression: str,
                  aggregation: str | None = None,
-                 dimensions: list[str] | None = None) -> dict:
+                 dimensions: list[str] | None = None,
+                 aliases: list[dict] | None = None) -> dict:
     impact = gate.change_impact(
         metrics,
         name=name,
@@ -116,6 +117,7 @@ def build_impact(metrics: list[dict], name: str, version: int, expression: str,
         new_expression=expression,
         new_aggregation=aggregation,
         new_dimensions=dimensions,
+        aliases=aliases,
     )
     impact["impact_id"] = new_id("imp")
     impact["created_at"] = now_iso()
@@ -126,13 +128,13 @@ def analyze(expression: str) -> dict:
     return expr.analyze_expression(expression)
 
 
-def overview(metrics: list[dict]) -> dict:
+def overview(metrics: list[dict], aliases: list[dict] | None = None) -> dict:
     """首页/复核页用的轻量概览（不落库）。"""
-    graph = graph_mod.build_graph(metrics)
+    graph = graph_mod.build_graph(metrics, aliases)
     cycles = graph_mod.find_cycles(graph)
     conflicts = conflict.detect_conflicts(metrics)
-    blockers = gate.publish_blockers(metrics)
-    cross = gate.cross_version_refs(metrics)
+    blockers = gate.publish_blockers(metrics, aliases)
+    cross = gate.cross_version_refs(metrics, aliases)
     summary = graph_mod.summary(graph)
     return {
         "metric_entries": len(metrics),

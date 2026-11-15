@@ -32,11 +32,37 @@ def split_key(key: str) -> tuple[str, int]:
     return name, int(version or 1)
 
 
-def build_graph(metrics: list[dict]) -> Graph:
+def build_graph(metrics: list[dict], aliases: list[dict] | None = None) -> Graph:
+    """构建依赖图。
+
+    aliases: 改名迁移沉淀的旧名→新名别名（[{'old_name','new_name'}]）。
+    历史公式里仍写旧名的引用，会经别名解析到当前名，保证改名迁移后
+    「旧公式仍兼容、不会突然变成不可解析引用」。
+    """
+    aliases = aliases or []
     graph = Graph(metrics=metrics)
     by_key = registry.index_by_key(metrics)
     published = registry.latest_published(metrics)
     all_names = set(registry.names(metrics))
+    alias_old_names = {alias["old_name"] for alias in aliases}
+
+    def current_name(ref_name: str) -> str:
+        if ref_name in all_names:
+            return ref_name
+        # 顺着别名链找到当前名（最多走 32 跳，防止脏数据成环）
+        seen: set[str] = set()
+        cursor = ref_name
+        for _ in range(32):
+            if cursor in all_names or cursor in seen:
+                break
+            seen.add(cursor)
+            step = next(
+                (alias["new_name"] for alias in aliases if alias["old_name"] == cursor), None
+            )
+            if step is None:
+                break
+            cursor = step
+        return cursor
 
     for metric in metrics:
         key = node_key(metric["name"], metric["version"])
@@ -59,32 +85,38 @@ def build_graph(metrics: list[dict]) -> Graph:
         for ref in analysis["metrics"]:
             ref_name = ref["name"]
             ref_version = ref["version"]
+            used_alias = ref_name in alias_old_names and ref_name not in all_names
+            resolved_name = current_name(ref_name)
             if ref_version is not None:
-                target_key = node_key(ref_name, ref_version)
+                target_key = node_key(resolved_name, ref_version)
                 if target_key not in graph.nodes:
                     graph.unresolved.append(
                         {
                             "from": key,
-                            "target": target_key,
+                            "target": node_key(ref_name, ref_version),
                             "reason": "version_not_found",
-                            "detail": f"{key} 引用了不存在的版本 {target_key}",
+                            "detail": f"{key} 引用了不存在的版本 {node_key(ref_name, ref_version)}"
+                            + (f"（旧名 {ref_name} 已改名为 {resolved_name}）" if used_alias else ""),
                         }
                     )
                     continue
             else:
-                latest = published.get(ref_name)
+                latest = published.get(resolved_name)
                 if latest is None:
-                    reason = "no_published_version" if ref_name in all_names else "metric_not_found"
+                    if resolved_name in all_names:
+                        reason = "no_published_version"
+                        detail = f"{key} 引用了无已发布版本的指标 {ref_name}"
+                    elif ref_name in alias_old_names:
+                        reason = "alias_no_published_version"
+                        detail = f"{key} 引用的旧名 {ref_name} 已改名为 {resolved_name}，但该指标当前没有已发布版本"
+                    else:
+                        reason = "metric_not_found"
+                        detail = f"{key} 引用了未注册的指标 {ref_name}"
                     graph.unresolved.append(
-                        {
-                            "from": key,
-                            "target": ref_name,
-                            "reason": reason,
-                            "detail": f"{key} 引用了 {'无已发布版本' if reason == 'no_published_version' else '未注册'} 的指标 {ref_name}",
-                        }
+                        {"from": key, "target": ref_name, "reason": reason, "detail": detail}
                     )
                     continue
-                target_key = node_key(ref_name, latest["version"])
+                target_key = node_key(resolved_name, latest["version"])
             if target_key not in graph.deps[key]:
                 graph.deps[key].append(target_key)
             if key not in graph.dependents[target_key]:

@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}改名迁移 · {{ app_name }}{% endblock %}
+{% block crumb %}改名迁移{% endblock %}
+{% block meta %}<span class="dot ok"></span>一组改名一次切换 · 失败回滚旧版注册表 · 旧名别名可追溯{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/review">回复核与发布</a>
+{% endblock %}
+{% block status_left %}改名迁移 {{ migration_records | length }} 次 · 历史别名 {{ aliases | length }} 条 · 不允许半新半旧中间态{% endblock %}
+{% block status_right %}{{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">指标改名迁移</h1>
+    <p class="page-sub">把一组改名当作<strong>一次迁移</strong>：先预演（受影响公式、新旧名称冲突、依赖变化），
+      预演通过后<strong>一次性切换</strong>新旧名称；切换失败自动恢复旧版注册表，重试复用同一迁移号、不重复产生版本；
+      迁移后旧名进入别名表，历史公式仍可解析并能查到对应版本与迁移来源。</p>
+  </div>
+</div>
+
+<div class="split result">
+  <div>
+    <section class="panel" id="migration-compose">
+      <div class="panel-head">
+        <h2>1 · 编排一组改名</h2>
+        <div class="panel-actions"><span class="tag">同批原子切换</span></div>
+      </div>
+      <div class="panel-body">
+        <div class="table-wrap">
+          <table class="dense" id="rename-rows">
+            <thead><tr><th style="width:44%">旧名（当前注册表）</th><th style="width:44%">新名</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="form-actions" style="margin-top:10px">
+          <button type="button" class="btn secondary small" id="btn-add-rename">+ 增加一条改名</button>
+          <button type="button" class="btn small" id="btn-preview">预演（不写注册表）</button>
+          <button type="button" class="btn small" id="btn-commit" disabled>预演通过后一次性切换</button>
+        </div>
+        <div id="migration-error" class="alert alert-error" hidden></div>
+        <details class="help" style="margin-top:10px">
+          <summary>演示建议</summary>
+          <p class="small muted" style="margin:0">把 <code>gmv_daily</code> 改成 <code>net_gmv_daily</code>：
+            预演会列出 gmv_daily 自身版本与 6 个引用它的下游公式，依赖结构守恒；切换后用旧名
+            <code>gmv_daily</code> 调 <code>/api/names/resolve?name=gmv_daily</code> 仍能查到版本与迁移来源。
+            再试把新名改成已存在的 <code>gmv</code>，会被 <code>new_name_taken</code> 冲突拦截。</p>
+        </details>
+      </div>
+    </section>
+
+    <section class="panel" id="migration-preview" hidden>
+      <div class="panel-head">
+        <h2>2 · 预演结果</h2>
+        <div class="panel-actions">
+          <span class="tag" id="preview-mig-id"></span>
+          <span class="tag" id="preview-verdict"></span>
+        </div>
+      </div>
+      <div class="panel-body tight">
+        <div id="preview-conflicts"></div>
+        <div class="kpi-strip" style="margin-bottom:0" id="preview-kpis"></div>
+      </div>
+      <div class="toolbar"><strong>受影响公式（自身改名 / 表达式引用旧名被改写）</strong>
+        <span class="spacer"></span><span class="small muted">归一化口径保持不变</span>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense" id="preview-formulas">
+          <thead><tr><th>旧键</th><th>新键</th><th>表达式改写</th><th>归一化（前 → 后）</th><th>状态</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="toolbar"><strong>预演后的依赖变化</strong><span class="spacer"></span>
+        <span class="small muted">边增/删、不可解析引用、图摘要</span>
+      </div>
+      <div class="panel-body tight" id="preview-deps"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>历史迁移记录</h2>
+        <div class="panel-actions"><span class="tag">{{ migration_records | length }} 条</span></div>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>迁移号</th><th>改名</th><th>状态</th><th>时间</th><th>说明</th></tr></thead>
+          <tbody>
+          {% for record in migration_records %}
+            <tr>
+              <td><a class="mono" href="/api/migrations/{{ record.migration_id }}">{{ record.migration_id }}</a></td>
+              <td class="small">
+                {% for item in record.renames %}<span class="tag">{{ item.old_name }} → {{ item.new_name }}</span> {% endfor %}
+              </td>
+              <td>
+                {% if record.status == 'committed' %}<span class="tag ok">committed</span>
+                {% elif record.status == 'rolled_back' %}<span class="tag err">rolled_back</span>
+                {% else %}<span class="tag warn">draft</span>{% endif %}
+              </td>
+              <td class="small muted">{{ record.updated_at or record.created_at }}</td>
+              <td class="small muted">{{ record.reason or '—' }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5" class="empty">还没有改名迁移记录。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel pane-sticky">
+    <div class="panel-head">
+      <h2>旧名别名与历史兼容</h2>
+      <div class="panel-actions"><span class="tag">{{ aliases | length }} 条</span></div>
+    </div>
+    <div class="panel-body">
+      <p class="small muted">迁移成功后，旧名的每个版本都沉淀一条别名：记录当前名、版本号与迁移来源（迁移号）。
+        依赖图解析引用时会顺别名链找到当前名，历史公式不会因改名变成不可解析引用。</p>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>旧名</th><th>当前名</th><th>版本</th><th>迁移来源</th></tr></thead>
+          <tbody>
+          {% for alias in aliases %}
+            <tr>
+              <td class="mono small">{{ alias.old_name }}</td>
+              <td class="mono small">{{ alias.new_name }}</td>
+              <td>v{{ alias.version }}</td>
+              <td><a class="mono small" href="/api/migrations/{{ alias.migration_id }}">{{ alias.migration_id }}</a></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="4" class="empty">还没有别名，完成一次改名迁移后出现。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="field" style="margin-top:12px">
+        <label for="resolve-name">按名字查版本与迁移来源（支持历史旧名）</label>
+        <input type="text" id="resolve-name" placeholder="例如 gmv_daily">
+      </div>
+      <button type="button" class="btn secondary small" id="btn-resolve">查询</button>
+      <div id="resolve-out" class="small" style="margin-top:8px"></div>
+    </div>
+  </section>
+</div>
+
+<script>
+window.MIGRATION_METRIC_NAMES = {{ metric_names | tojson }};
+</script>
+{% endblock %}

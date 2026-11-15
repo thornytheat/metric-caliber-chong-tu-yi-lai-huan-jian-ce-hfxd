@@ -11,6 +11,7 @@
 - **同名异口径**：同名指标按归一化表达式分组，>1 组即 conflict，列出各组版本与差异摘要。
 - **变更门禁**：改表达式/维度/聚合 → 算全部传递下游，分 `breaking`（移除下游依赖的维度、改聚合、引入环、引用未发布版本）与 `requires_sync`。
 - **发布校验**：被引用版本必须 `published=true`，且不得处于环中、不得与已发布基线口径不同。
+- **改名迁移（一组改名一次切换）**：一组改名作为一次迁移，先预演（受影响公式、新旧名称冲突、预演后的依赖变化），预演通过后在单事务里一次性切换指标行与全部下游表达式；切换失败回滚旧版注册表，重试按确定性指纹复用同一迁移号、不重复产生迁移记录或版本；迁移后旧名进入别名表，历史公式经别名链继续解析，并可按旧名查到当前版本与迁移来源。
 
 ## 核心规则（后端真算）
 
@@ -23,6 +24,8 @@
 | 口径冲突 | `app/conflict.py` | 同名 → 归一化分组 → 组数 > 1 即 conflict |
 | 变更门禁 | `app/gate.py` | 传递下游 + `breaking`/`requires_sync` 判定 |
 | 发布门禁 | `app/gate.py` | `unpublished_reference` / `missing_reference` / `cycle_member` / `caliber_conflict` |
+| 改名迁移 | `app/migration.py` | 预演（受影响公式/名称冲突/依赖变化）+ 一次性改名；别名链解析旧名，纯函数 |
+| 迁移事务 | `app/store.py` | `rename_migrations`（含旧版快照）+ `name_aliases`；失败回滚、指纹幂等 |
 
 样例数据 `sample_data/metrics.json`：24 个指标版本 / 20 个指标名，故意包含
 **3 组同名异口径**（gmv 三口径、uv 两口径、conversion_rate 原值与百分比）、
@@ -54,6 +57,7 @@ docker compose down -v        # 重建数据库：删掉 metricring-data 卷即�
 | `/workbench` | 选指标、编辑表达式/维度/聚合、解析归一化、影响面、上游依赖树、注册表全量 |
 | `/result/{check_id}` | 冲突 3 组、环 2 条、发布阻断、跨版本依赖、全部指标归一化前后对比 |
 | `/review` | 最近体检、变更影响面（breaking / requires_sync）、发布按钮、版本历史与历史体检 |
+| `/migrations` | 编排一组改名、预演（受影响公式/冲突/依赖变化）、一次性切换、迁移记录与旧名别名追溯 |
 
 ## API
 
@@ -68,6 +72,11 @@ docker compose down -v        # 重建数据库：删掉 metricring-data 卷即�
 | POST | `/api/impact` | `{name,version?,expression,aggregation?,dimensions?}` → 影响面；指标不存在 404、表达式非法 400 |
 | POST | `/api/registry` | 登记新版本；重复 409、字段非法或缺引用 400 |
 | POST | `/api/publish` | 发布校验；被拦截 409 并返回 blockers |
+| POST | `/api/migrations/preview` | 改名迁移预演：`{renames:[{old_name,new_name}],persist?}` → 受影响公式、名称冲突、依赖变化 |
+| POST | `/api/migrations/commit` | 预演通过后一次性切换；冲突 409、切换失败 409 并回滚；同指纹重试幂等 |
+| GET | `/api/migrations` / `/api/migrations/{id}` | 迁移记录列表 / 详情（含旧版注册表快照） |
+| GET | `/api/aliases` | 旧名→当前名/版本/迁移来源（含链式改名链路） |
+| GET | `/api/names/resolve?name=` | 按当前名或历史旧名查版本与迁移来源；未知 404 |
 
 ```bash
 # 注册表与体检
@@ -81,19 +90,51 @@ curl -s -X POST http://127.0.0.1:18215/api/check | python3 -c "import json,sys;d
 app/
   main.py        # FastAPI 路由（薄）
   expr.py        # 公式解析 + 归一化（纯函数）
-  graph.py       # 依赖图 + DFS 三色环检测
+  graph.py       # 依赖图 + DFS 三色环检测（支持别名解析旧名）
   conflict.py    # 同名异口径
   gate.py        # 变更门禁 + 发布门禁
+  migration.py   # 改名迁移：预演/一次性改名/别名链（纯函数）
   registry.py    # 指标注册校验/索引/版本解析
   report.py      # 体检编排
-  store.py       # SQLite
+  store.py       # SQLite（含 rename_migrations / name_aliases 与事务回滚）
   seed.py        # 幂等 seed
   settings.py    # 路径常量
-  templates/     # base/index/workbench/result/review
+  templates/     # base/index/workbench/result/review/migrations
   static/        # app.js（原生）、style.css
 sample_data/metrics.json
-tests/           # test_expr / test_graph / test_conflict / test_gate / test_api
+tests/           # test_expr / test_graph / test_conflict / test_gate / test_api / test_migration
 ```
+
+## 改名迁移
+
+一组改名必须当作一次迁移，避免「一半公式认旧名、一半认新名」的中间态让体检与影响面给出两种结果：
+
+```bash
+# 1) 预演：只算不写，列受影响公式、名称冲突、依赖变化
+curl -s -X POST http://127.0.0.1:18215/api/migrations/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"renames":[{"old_name":"gmv_daily","new_name":"net_gmv_daily"}]}' | python3 -m json.tool
+
+# 2) 预演通过后一次性切换（单事务；失败回滚旧版注册表）
+curl -s -X POST http://127.0.0.1:18215/api/migrations/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"renames":[{"old_name":"gmv_daily","new_name":"net_gmv_daily"}]}'
+
+# 3) 旧名仍可查到当前版本与迁移来源（历史公式兼容）
+curl -s 'http://127.0.0.1:18215/api/names/resolve?name=gmv_daily'
+```
+
+关键约束：
+
+- **冲突拦截**：新名已被占用（`new_name_taken`）、改名链 A→B 且 B→C（`target_renamed_twice`）、
+  多个旧名改同一新名（`duplicate_target`）、旧名不存在、新名不合法、旧名已是历史别名，预演直接阻断。
+- **结构守恒**：预演把切换后的依赖边映射回旧名空间对比，只允许纯名称平移——边不增删、环数不变、
+  不产生新的不可解析引用；归一化口径在把新名换回旧名后必须逐字一致。
+- **失败回滚 + 幂等重试**：迁移号是改名集合的确定性指纹（与顺序无关）。切换在一个事务内
+  先存旧版快照再清空重写，任何一步失败都 `rollback` 恢复旧版注册表并把记录置为 `rolled_back`；
+  重试复用同一迁移号，已 `committed` 的同号迁移直接幂等返回，不重复产生迁移记录、别名或版本。
+- **历史兼容**：切换后旧名的每个版本写一条 `name_aliases`（含迁移号），依赖图/门禁解析引用时
+  顺别名链找到当前名，仍写 `metric:旧名` 的历史公式不会变成不可解析引用。
 
 ## 测试
 
